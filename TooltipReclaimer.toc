@@ -2,7 +2,7 @@
 # WoW Forever only. Do not add retail/classic Interface values; BigWigs Packager
 # uploads every Interface value as a supported CurseForge / Wago game version.
 ## Title: Tooltip Reclaimer
-## Notes: Names the addon that added each tooltip line. /ttr toggles it.
+## Notes: Names the addon that added each tooltip line. Configure under Options > AddOns, or /ttr options.
 ## Author: Ty
 ## Version: @project-version@
 ## SavedVariables: TooltipReclaimerDB
