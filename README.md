@@ -29,8 +29,3 @@ Under **Esc > Options > AddOns > Tooltip Reclaimer**:
 
 
 ## Releases
-
-```
-git tag 1-0-1-release
-git push origin 1-0-1-release
-```
