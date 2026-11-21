@@ -13,7 +13,7 @@ Under **Esc > Options > AddOns > Tooltip Reclaimer**:
 - Show source labels
 - Show client lines
 - Show file names
-- Detected addon hooks: each addon that has written a tooltip line, with the source file. Uncheck one to remove that addon's lines from tooltips.
+- Detected addon hooks: each addon that has written a tooltip line, with the source file
 
 ## Commands
 

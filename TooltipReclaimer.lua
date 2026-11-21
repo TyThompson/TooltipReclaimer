@@ -4,7 +4,7 @@
 -- the calling file is read from debugstack. Lines drawn by the client are
 -- "Game" and stay hidden unless /ttr game is on. The labels are a separate
 -- frame. Detected addon hooks are listed under Options with the file they
--- came from, and unchecking one removes that addon's lines from the tooltip.
+-- came from.
 
 local ADDON = ...
 local SELF = "TooltipReclaimer"
@@ -15,7 +15,6 @@ local db = {
     showGame = false,
     showFile = false,
     seen = {},
-    hidden = {},
 }
 
 local sourceOf = setmetatable({}, { __mode = "k" })
@@ -25,13 +24,7 @@ local hookedFonts = setmetatable({}, { __mode = "k" })
 local overlays = {}
 local errorOnce
 
-local Remember, PackTooltip, QueuePack
-local packing
-local packQueued = setmetatable({}, { __mode = "k" })
--- One compress per hover (cleared on Hide). After that, OnUpdate only enforces
--- bottom padding so a later client resize can't clip the last line again.
-local packedOnce = setmetatable({}, { __mode = "k" })
-local fitHold = setmetatable({}, { __mode = "k" })
+local Remember
 
 local function Say(msg)
     print("|cff6ec6ffTooltip Reclaimer|r  " .. msg)
@@ -47,7 +40,8 @@ local function LoadDB()
     if saved.showGame == nil then saved.showGame = false end
     if saved.showFile == nil then saved.showFile = false end
     if type(saved.seen) ~= "table" then saved.seen = {} end
-    if type(saved.hidden) ~= "table" then saved.hidden = {} end
+    -- Drop leftover filter data from older versions.
+    saved.hidden = nil
     for name, value in pairs(saved.seen) do
         if type(value) ~= "table" then saved.seen[name] = {} end
     end
@@ -62,10 +56,6 @@ end
 
 local function IsPlayer(addon)
     return addon and not IsClient(addon)
-end
-
-local function IsHidden(addon)
-    return type(db.hidden) == "table" and db.hidden[addon] == true
 end
 
 -- Midnight tooltips hand back secret numbers. type() still says "number",
@@ -271,7 +261,6 @@ local function HookFontString(fs)
         end
         if state[method] == fn then return end
         hooksecurefunc(fs, method, function(self)
-            if packing then return end
             local addon, detail = Caller()
             local parent = self.GetParent and self:GetParent()
             Remember(self, addon, detail, false, parent)
@@ -282,245 +271,17 @@ local function HookFontString(fs)
     hook("SetFormattedText")
 end
 
-local function Snapshot(fs)
-    local okT, text = pcall(fs.GetText, fs)
-    if not okT then return end
-    local r, g, b
-    local okC, cr, cg, cb = pcall(fs.GetTextColor, fs)
-    if okC then
-        r, g, b = PlainNumber(cr), PlainNumber(cg), PlainNumber(cb)
-    end
-    return text, r, g, b, true
-end
-
-local function BlankFont(fs)
-    if not fs then return end
-    pcall(fs.SetText, fs, "")
-    pcall(fs.Hide, fs)
-    if fs.SetAlpha then pcall(fs.SetAlpha, fs, 0) end
-    sourceOf[fs] = nil
-end
-
-local function WriteFont(fs, entry)
-    if not fs then return end
-    if not entry then
-        BlankFont(fs)
-        return
-    end
-    if not entry.data then
-        -- Kept the slot but couldn't snapshot (rare); leave the glyphs alone.
-        sourceOf[fs] = entry.src
-        return
-    end
-    if fs.SetAlpha then pcall(fs.SetAlpha, fs, 1) end
-    pcall(fs.Show, fs)
-    pcall(fs.SetText, fs, entry.data.text)
-    if entry.data.r then
-        pcall(fs.SetTextColor, fs, entry.data.r, entry.data.g, entry.data.b)
-    end
-    sourceOf[fs] = entry.src
-end
-
-local function LineBlocked(fs)
-    local src = fs and sourceOf[fs]
-    return src and IsHidden(src.addon) or false
-end
-
--- Copy a line even when the text is secret (Forever/Midnight). Passing the
--- value straight into SetText is fine; reading it for compares is not.
-local function ReadLine(fs)
-    local text, r, g, b, hasText = Snapshot(fs)
-    if not hasText then return nil end
-    if IsSecret(text) then
-        return { text = text }
-    end
-    return { text = text, r = r, g = g, b = b }
-end
-
-local function LineBottom(fs)
-    if not fs then return nil end
-    local bottom = Metric(fs, "GetBottom")
-    if bottom then return bottom end
-    local top = Metric(fs, "GetTop")
-    if not top then return nil end
-    local extent = Metric(fs, "GetStringHeight") or Metric(fs, "GetHeight")
-    if extent then return top - extent end
-end
-
--- True if the fontstring is up (even alpha 0 spacers); ignores string-width.
-local function IsUp(fs)
-    return fs and Flag(fs, "IsShown") and true or false
-end
-
--- Grow the frame so the lowest shown line has BOTTOM_PAD px of air under it.
--- Uses height shortfall (not absolute tipTop math) so bottom-anchored tips work.
--- Safe to call every OnUpdate: no-ops when the gap is already large enough.
-local BOTTOM_PAD = 32
-local function FitPackedTooltip(tooltip)
-    local tipBottom = Metric(tooltip, "GetBottom")
-    local height = Metric(tooltip, "GetHeight")
-    if not tipBottom or not height then return end
-
-    local bottom
-    ForEachLine(tooltip, function(_, left, right)
-        local fs = IsUp(left) and left or (IsUp(right) and right or nil)
-        local lineBottom = LineBottom(fs)
-        if lineBottom then
-            bottom = bottom and math.min(bottom, lineBottom) or lineBottom
-        end
-    end)
-    -- Also cover money frames hanging under a "Sell Price" line.
-    if tooltip.GetName then
-        local ok, name = pcall(tooltip.GetName, tooltip)
-        if ok and type(name) == "string" then
-            for i = 1, 4 do
-                local money = _G[name .. "MoneyFrame" .. i]
-                if money and Flag(money, "IsShown") then
-                    local mb = Metric(money, "GetBottom")
-                    if mb then
-                        bottom = bottom and math.min(bottom, mb) or mb
-                    end
-                end
-            end
-        end
-    end
-    -- No measurable lines (secrets): do nothing — never grow unboundedly on OnUpdate.
-    if not bottom then return end
-
-    local gap = bottom - tipBottom
-    if gap >= BOTTOM_PAD then return end
-    pcall(tooltip.SetHeight, tooltip, height + (BOTTOM_PAD - gap))
-end
-
--- Invisible spacer under the last kept line so measurement has a pad row.
-local function AddBottomSpacer(pair)
-    if not pair or not pair.left then return end
-    local fs = pair.left
-    pcall(fs.SetText, fs, ".")
-    if fs.SetAlpha then pcall(fs.SetAlpha, fs, 0) end
-    pcall(fs.Show, fs)
-    sourceOf[fs] = nil
-end
-
--- Drop lines a blocked addon added and close the gap by sliding the kept
--- lines up. Runs at most once per hover.
-PackTooltip = function(tooltip, force)
-    if packing or type(tooltip) ~= "table" then return end
-    if packedOnce[tooltip] and not force then return end
-
-    local linePairs = {}
-    ForEachLine(tooltip, function(_, left, right)
-        linePairs[#linePairs + 1] = { left = left, right = right }
-    end)
-
-    local kept = {}
-    local blocked = false
-    for _, pair in ipairs(linePairs) do
-        local showL, showR = Shown(pair.left), Shown(pair.right)
-        if showL or showR then
-            local blockL = showL and LineBlocked(pair.left)
-            local blockR = showR and LineBlocked(pair.right)
-            if blockL or blockR then blocked = true end
-            local keepL = showL and not blockL
-            local keepR = showR and not blockR
-            if keepL or keepR then
-                kept[#kept + 1] = {
-                    left = keepL and { data = ReadLine(pair.left), src = sourceOf[pair.left] } or nil,
-                    right = keepR and { data = ReadLine(pair.right), src = sourceOf[pair.right] } or nil,
-                }
-            end
-        end
-    end
-    if not blocked then return end
-
-    packing = true
-    local okPack, packErr = pcall(function()
-        for i, pair in ipairs(linePairs) do
-            local row = kept[i]
-            if row then
-                WriteFont(pair.left, row.left)
-                WriteFont(pair.right, row.right)
-            elseif Shown(pair.left) or Shown(pair.right) or sourceOf[pair.left] or sourceOf[pair.right] then
-                BlankFont(pair.left)
-                BlankFont(pair.right)
-            end
-        end
-        AddBottomSpacer(linePairs[#kept + 1])
-        FitPackedTooltip(tooltip)
-    end)
-    packing = false
-    packedOnce[tooltip] = true
-    if okPack then
-        fitHold[tooltip] = true
-    elseif not errorOnce then
-        errorOnce = true
-        Say("|cffff8888couldn't remove a blocked line:|r " .. tostring(packErr))
-    end
-end
-
-QueuePack = function(tooltip)
-    if packing or type(tooltip) ~= "table" then return end
-    if packedOnce[tooltip] or packQueued[tooltip] then return end
-    packQueued[tooltip] = true
-    local function run()
-        packQueued[tooltip] = nil
-        -- Second defer so other addons' After(0) stock/craft lines land first.
-        local function go()
-            PackTooltip(tooltip)
-        end
-        if C_Timer and C_Timer.After then
-            C_Timer.After(0, go)
-        else
-            go()
-        end
-    end
-    if C_Timer and C_Timer.After then
-        C_Timer.After(0, run)
-    else
-        run()
-    end
-end
-
 -- upgradeOnly fills a line AddLine created before its fontstring was hooked.
 -- A later SetText (upgradeOnly false) is the real writer and replaces it.
-Remember = function(fs, addon, detail, upgradeOnly, tooltip)
-    if packing or not fs or not addon then return false end
+Remember = function(fs, addon, detail, upgradeOnly)
+    if not fs or not addon then return end
     NoteSeen(addon, detail)
     HookFontString(fs)
-    if IsPlayer(addon) and IsHidden(addon) then
-        local prev = sourceOf[fs]
-        if prev and prev.hasText and not IsHidden(prev.addon) and not upgradeOnly then
-            packing = true
-            pcall(fs.SetText, fs, prev.text)
-            if prev.r then pcall(fs.SetTextColor, fs, prev.r, prev.g, prev.b) end
-            packing = false
-            sourceOf[fs] = prev
-            return false
-        end
-        sourceOf[fs] = { addon = addon, detail = detail }
-        if type(tooltip) == "table" and packedOnce[tooltip] then
-            -- Already resized this fill — hide only, never refit.
-            packing = true
-            pcall(fs.SetText, fs, "")
-            pcall(fs.Hide, fs)
-            if fs.SetAlpha then pcall(fs.SetAlpha, fs, 0) end
-            packing = false
-        elseif type(tooltip) == "table" then
-            QueuePack(tooltip)
-        end
-        return false
-    end
     local prev = sourceOf[fs]
     if upgradeOnly and prev and (IsPlayer(prev.addon) or not IsPlayer(addon)) then
-        return false
+        return
     end
-    local text, r, g, b, hasText = Snapshot(fs)
-    sourceOf[fs] = {
-        addon = addon, detail = detail,
-        text = text, r = r, g = g, b = b,
-        hasText = hasText and true or false,
-    }
-    return false
+    sourceOf[fs] = { addon = addon, detail = detail }
 end
 
 local OnAdded, ClearSources
@@ -549,21 +310,17 @@ local function InstallHooks(tooltip)
 end
 
 OnAdded = function(tooltip, isDouble)
-    if packing then return end
     local addon, detail = Caller()
     local count = PlainNumber(select(2, pcall(tooltip.NumLines, tooltip)))
     if not count or count < 1 then return end
-    Remember(FontString(tooltip, "TextLeft", count), addon, detail, true, tooltip)
+    Remember(FontString(tooltip, "TextLeft", count), addon, detail, true)
     if isDouble then
-        Remember(FontString(tooltip, "TextRight", count), addon, detail, true, tooltip)
+        Remember(FontString(tooltip, "TextRight", count), addon, detail, true)
     end
     InstallHooks(tooltip)
 end
 
 ClearSources = function(tooltip)
-    -- Leave packedOnce alone until OnHide. Clearing it here re-packs on every
-    -- in-place rebuild and strobes the tip.
-    packQueued[tooltip] = nil
     ForEachLine(tooltip, function(_, left, right)
         if left then sourceOf[left] = nil end
         if right then sourceOf[right] = nil end
@@ -594,14 +351,13 @@ local function OnScreen(tooltip)
     return true
 end
 
-local function Collect(left, right, includeGame, includeHidden)
+local function Collect(left, right, includeGame)
     local out = {}
     local function add(fs)
         if not Shown(fs) then return end
         local src = sourceOf[fs]
         local addon = src and src.addon or "Game"
         if not includeGame and IsClient(addon) then return end
-        if not includeHidden and IsHidden(addon) then return end
         local detail = src and src.detail
         local last = out[#out]
         if last and last.addon == addon and last.detail == detail then return end
@@ -612,14 +368,10 @@ local function Collect(left, right, includeGame, includeHidden)
     return out
 end
 
-local function FormatSources(sources, withFile, markHidden)
+local function FormatSources(sources, withFile)
     local names, details = {}, {}
     for _, src in ipairs(sources) do
-        local name = Colored(src.addon)
-        if markHidden and IsHidden(src.addon) then
-            name = name .. " |cff777777(hidden)|r"
-        end
-        names[#names + 1] = name
+        names[#names + 1] = Colored(src.addon)
         if src.detail then details[#details + 1] = src.detail end
     end
     local text = table.concat(names, "  |cff777777/|r  ")
@@ -705,8 +457,6 @@ local function Refresh(tooltip)
     end
     InstallHooks(tooltip)
 
-    -- Labels can be off while the blocked-addon filter keeps running.
-    -- Do not QueuePack here — OnShow/OnUpdate would re-enter every layout tick.
     if not db.enabled then
         overlay:Hide()
         return
@@ -812,18 +562,10 @@ local function Track(tooltip)
         InstallHooks(tooltip)
         tooltip:HookScript("OnShow", function(self) SafeRefresh(self) end)
         tooltip:HookScript("OnHide", function(self)
-            packedOnce[self] = nil
-            fitHold[self] = nil
-            packQueued[self] = nil
             local overlay = overlays[self]
             if overlay then overlay:Hide() end
         end)
         tooltip:HookScript("OnUpdate", function(self)
-            if fitHold[self] and Flag(self, "IsShown") then
-                packing = true
-                pcall(FitPackedTooltip, self)
-                packing = false
-            end
             if db.enabled and Flag(self, "IsShown") then SafeRefresh(self) end
         end)
     end)
@@ -883,11 +625,11 @@ local function Dump(tooltip)
     ForEachLine(tooltip, function(i, left, right)
         if not Shown(left) and not Shown(right) then return end
         any = true
-        local sources = Collect(left, right, true, true)
+        local sources = Collect(left, right, true)
         if #sources == 0 then
             Say(i .. "  " .. Colored("Game"))
         else
-            Say(i .. "  " .. FormatSources(sources, true, true))
+            Say(i .. "  " .. FormatSources(sources, true))
         end
     end)
     if not any then Say("That tooltip has no text lines.") end
@@ -1069,33 +811,10 @@ local function NewBlockSettingRow(parent, key, label, description)
     return row
 end
 
-local hookRowSerial = 0
-
-local function NewAddonRow(parent, addon, shown, onToggle)
-    hookRowSerial = hookRowSerial + 1
+local function NewAddonRow(parent, addon)
     local row = CreateFrame("Frame", nil, parent)
     row:SetSize(500, 28)
     row.addon = addon
-
-    local check = CreateFrame("CheckButton", "TooltipReclaimerHook" .. hookRowSerial .. "CheckButton", row, "InterfaceOptionsCheckButtonTemplate")
-    check:SetPoint("RIGHT", row, "RIGHT", -2, 0)
-    local templateText = _G[check:GetName() .. "Text"]
-    if templateText then
-        templateText:SetText("")
-        templateText:Hide()
-    end
-    check:SetHitRectInsets(0, 0, 0, 0)
-    check:SetChecked(shown and true or false)
-    check:SetScript("OnClick", function(self)
-        local tick = self:GetChecked() and true or false
-        onToggle(addon, tick)
-        if tick then
-            PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
-        else
-            PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_OFF)
-        end
-    end)
-    row.check = check
 
     local title = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     title:SetJustifyH("LEFT")
@@ -1118,28 +837,21 @@ local function NewAddonRow(parent, addon, shown, onToggle)
             self.file:SetText("")
             self.file:Hide()
             self.title:SetPoint("LEFT", 4, 0)
-            self.title:SetPoint("RIGHT", self.check, "LEFT", -14, 0)
+            self.title:SetPoint("RIGHT", -4, 0)
             self:SetHeight(28)
             return
         end
         self.file:Show()
         self.file:SetText(text)
         self.title:SetPoint("TOPLEFT", 4, -5)
-        self.title:SetPoint("TOPRIGHT", self.check, "LEFT", -14, -5)
+        self.title:SetPoint("TOPRIGHT", -4, -5)
         self.file:SetPoint("TOPLEFT", self.title, "BOTTOMLEFT", 0, -1)
-        self.file:SetPoint("RIGHT", self.check, "LEFT", -14, 0)
+        self.file:SetPoint("RIGHT", -4, 0)
         local height = Metric(self.file, "GetStringHeight") or 12
         self:SetHeight(math.max(40, 8 + 16 + height))
     end
     row:Reflow()
-
-    AttachBlockRowHover(row, check)
-    row:SetScript("OnMouseUp", function(_, button)
-        if button and button ~= "LeftButton" then return end
-        if not check:IsEnabled() then return end
-        if check.IsMouseOver and check:IsMouseOver() then return end
-        check:Click()
-    end)
+    AttachBlockRowHover(row)
 
     return row
 end
@@ -1227,7 +939,7 @@ local function RegisterOptions()
     addonHeaderText:SetPoint("BOTTOMLEFT", 4, 2)
     addonHeaderText:SetText("Detected addon hooks")
     local addonInfo = CreateInfoButton(addonHeader, "Detected addon hooks",
-        "Addons that have written a tooltip line, and the file the hook came from. Uncheck one to remove that addon's lines from tooltips. Check it again and hover once more to bring them back.")
+        "Addons that have written a tooltip line, and the file the hook came from.")
     addonInfo:SetPoint("LEFT", addonHeaderText, "RIGHT", 6, 0)
 
     local addonBlock = CreateFrame("Frame", nil, page, "BackdropTemplate")
@@ -1243,28 +955,6 @@ local function RegisterOptions()
     emptyText:SetWordWrap(true)
     emptyText:SetTextColor(0.62, 0.62, 0.62)
     emptyText:SetText("None yet. Hover a tooltip and the hooks that write to it show up here.")
-
-    local function SetAddonShown(addon, shown)
-        if type(db.hidden) ~= "table" then db.hidden = {} end
-        if shown then
-            db.hidden[addon] = nil
-        else
-            db.hidden[addon] = true
-        end
-        local row = addonRows[addon]
-        if row and row.check then
-            row.check:SetChecked(shown and true or false)
-        end
-        if not shown then
-            for tooltip in pairs(tracked) do
-                if Flag(tooltip, "IsShown") then
-                    packedOnce[tooltip] = nil
-                    PackTooltip(tooltip, true)
-                end
-            end
-        end
-        RefreshShown()
-    end
 
     local function SyncAddonRows()
         local names = {}
@@ -1284,10 +974,9 @@ local function RegisterOptions()
         for _, name in ipairs(names) do
             local row = addonRows[name]
             if not row then
-                row = NewAddonRow(addonBlock, name, not IsHidden(name), SetAddonShown)
+                row = NewAddonRow(addonBlock, name)
                 addonRows[name] = row
             else
-                row.check:SetChecked(not IsHidden(name))
                 row:Reflow()
             end
         end
@@ -1349,11 +1038,6 @@ local function RegisterOptions()
     local function RefreshChecks()
         for key, check in pairs(optionChecks) do
             check:SetChecked(db[key] and true or false)
-        end
-        for name, row in pairs(addonRows) do
-            if row.check then
-                row.check:SetChecked(not IsHidden(name))
-            end
         end
     end
 
