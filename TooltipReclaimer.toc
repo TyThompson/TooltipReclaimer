@@ -9,8 +9,8 @@
 
 TooltipReclaimer.lua
 
-# Optional later, once a project exists:
-# ## X-Curse-Project-ID: <id>
+## X-Curse-Project-ID: 1820980
+# Optional later:
 # ## X-WoWI-ID: <id>
 # ## X-Wago-ID: <id>
 ## X-Website: https://github.com/TyThompson/TooltipReclaimer
