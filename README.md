@@ -1,4 +1,4 @@
-# Tooltip Reclaimer
+# TooltipReclaimer
 
 Tooltip Reclaimer names the addon that added each line of a tooltip on **WoW Forever**.
 
@@ -27,11 +27,8 @@ Under **Esc > Options > AddOns > Tooltip Reclaimer**:
 /ttr list        print sources for the tooltip under the cursor
 ```
 
-The CurseForge project logo is `logo.jpg` (1024×1024). Upload that file as the project logo. It is left out of the addon zip.
 
 ## Releases
-
-Version tags use the same form as TyGear. Pushing one builds the zip and publishes a GitHub release.
 
 ```
 git tag 1-0-1-release
