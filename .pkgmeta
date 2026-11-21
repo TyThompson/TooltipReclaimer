@@ -1,0 +1,9 @@
+package-as: TooltipReclaimer
+
+ignore:
+  - .git
+  - .github
+  - .vscode
+  - .pkgmeta
+  - .gitignore
+  - logo.jpg

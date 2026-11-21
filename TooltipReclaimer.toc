@@ -1,0 +1,16 @@
+## Interface: 16001
+# WoW Forever only. Do not add retail/classic Interface values; BigWigs Packager
+# uploads every Interface value as a supported CurseForge / Wago game version.
+## Title: Tooltip Reclaimer
+## Notes: Names the addon that added each tooltip line. /ttr toggles it.
+## Author: Ty
+## Version: @project-version@
+## SavedVariables: TooltipReclaimerDB
+
+TooltipReclaimer.lua
+
+# Optional later, once a project exists:
+# ## X-Curse-Project-ID: <id>
+# ## X-WoWI-ID: <id>
+# ## X-Wago-ID: <id>
+## X-Website: https://github.com/TyThompson/TooltipReclaimer
