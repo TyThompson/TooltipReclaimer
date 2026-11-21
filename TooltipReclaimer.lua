@@ -28,6 +28,10 @@ local errorOnce
 local Remember, PackTooltip, QueuePack
 local packing
 local packQueued = setmetatable({}, { __mode = "k" })
+-- One compress per hover (cleared on Hide). After that, OnUpdate only enforces
+-- bottom padding so a later client resize can't clip the last line again.
+local packedOnce = setmetatable({}, { __mode = "k" })
+local fitHold = setmetatable({}, { __mode = "k" })
 
 local function Say(msg)
     print("|cff6ec6ffTooltip Reclaimer|r  " .. msg)
@@ -267,12 +271,10 @@ local function HookFontString(fs)
         end
         if state[method] == fn then return end
         hooksecurefunc(fs, method, function(self)
-            if packing or not db.enabled then return end
+            if packing then return end
             local addon, detail = Caller()
-            if Remember(self, addon, detail, false) then
-                local parent = self.GetParent and self:GetParent()
-                if type(parent) == "table" then QueuePack(parent) end
-            end
+            local parent = self.GetParent and self:GetParent()
+            Remember(self, addon, detail, false, parent)
         end)
         state[method] = fs[method]
     end
@@ -301,8 +303,13 @@ end
 
 local function WriteFont(fs, entry)
     if not fs then return end
-    if not entry or not entry.data then
+    if not entry then
         BlankFont(fs)
+        return
+    end
+    if not entry.data then
+        -- Kept the slot but couldn't snapshot (rare); leave the glyphs alone.
+        sourceOf[fs] = entry.src
         return
     end
     if fs.SetAlpha then pcall(fs.SetAlpha, fs, 1) end
@@ -319,10 +326,88 @@ local function LineBlocked(fs)
     return src and IsHidden(src.addon) or false
 end
 
+-- Copy a line even when the text is secret (Forever/Midnight). Passing the
+-- value straight into SetText is fine; reading it for compares is not.
+local function ReadLine(fs)
+    local text, r, g, b, hasText = Snapshot(fs)
+    if not hasText then return nil end
+    if IsSecret(text) then
+        return { text = text }
+    end
+    return { text = text, r = r, g = g, b = b }
+end
+
+local function LineBottom(fs)
+    if not fs then return nil end
+    local bottom = Metric(fs, "GetBottom")
+    if bottom then return bottom end
+    local top = Metric(fs, "GetTop")
+    if not top then return nil end
+    local extent = Metric(fs, "GetStringHeight") or Metric(fs, "GetHeight")
+    if extent then return top - extent end
+end
+
+-- True if the fontstring is up (even alpha 0 spacers); ignores string-width.
+local function IsUp(fs)
+    return fs and Flag(fs, "IsShown") and true or false
+end
+
+-- Grow the frame so the lowest shown line has BOTTOM_PAD px of air under it.
+-- Uses height shortfall (not absolute tipTop math) so bottom-anchored tips work.
+-- Safe to call every OnUpdate: no-ops when the gap is already large enough.
+local BOTTOM_PAD = 32
+local function FitPackedTooltip(tooltip)
+    local tipBottom = Metric(tooltip, "GetBottom")
+    local height = Metric(tooltip, "GetHeight")
+    if not tipBottom or not height then return end
+
+    local bottom
+    ForEachLine(tooltip, function(_, left, right)
+        local fs = IsUp(left) and left or (IsUp(right) and right or nil)
+        local lineBottom = LineBottom(fs)
+        if lineBottom then
+            bottom = bottom and math.min(bottom, lineBottom) or lineBottom
+        end
+    end)
+    -- Also cover money frames hanging under a "Sell Price" line.
+    if tooltip.GetName then
+        local ok, name = pcall(tooltip.GetName, tooltip)
+        if ok and type(name) == "string" then
+            for i = 1, 4 do
+                local money = _G[name .. "MoneyFrame" .. i]
+                if money and Flag(money, "IsShown") then
+                    local mb = Metric(money, "GetBottom")
+                    if mb then
+                        bottom = bottom and math.min(bottom, mb) or mb
+                    end
+                end
+            end
+        end
+    end
+    -- No measurable lines (secrets): do nothing — never grow unboundedly on OnUpdate.
+    if not bottom then return end
+
+    local gap = bottom - tipBottom
+    if gap >= BOTTOM_PAD then return end
+    pcall(tooltip.SetHeight, tooltip, height + (BOTTOM_PAD - gap))
+end
+
+-- Invisible spacer under the last kept line so measurement has a pad row.
+local function AddBottomSpacer(pair)
+    if not pair or not pair.left then return end
+    local fs = pair.left
+    pcall(fs.SetText, fs, ".")
+    if fs.SetAlpha then pcall(fs.SetAlpha, fs, 0) end
+    pcall(fs.Show, fs)
+    sourceOf[fs] = nil
+end
+
 -- Drop lines a blocked addon added and close the gap by sliding the kept
--- lines up. Returns true when a line was removed.
-PackTooltip = function(tooltip)
+-- lines up. Runs at most once per hover.
+PackTooltip = function(tooltip, force)
     if packing or type(tooltip) ~= "table" then return end
+    if packedOnce[tooltip] and not force then return end
+
     local linePairs = {}
     ForEachLine(tooltip, function(_, left, right)
         linePairs[#linePairs + 1] = { left = left, right = right }
@@ -330,7 +415,6 @@ PackTooltip = function(tooltip)
 
     local kept = {}
     local blocked = false
-    local unreadable = false
     for _, pair in ipairs(linePairs) do
         local showL, showR = Shown(pair.left), Shown(pair.right)
         if showL or showR then
@@ -340,21 +424,10 @@ PackTooltip = function(tooltip)
             local keepL = showL and not blockL
             local keepR = showR and not blockR
             if keepL or keepR then
-                local function read(fs)
-                    local text, r, g, b, hasText = Snapshot(fs)
-                    if not hasText or IsSecret(text) then return nil end
-                    return { text = text, r = r, g = g, b = b }
-                end
-                local leftEntry, rightEntry
-                if keepL then
-                    leftEntry = { data = read(pair.left), src = sourceOf[pair.left] }
-                    if not leftEntry.data then unreadable = true end
-                end
-                if keepR then
-                    rightEntry = { data = read(pair.right), src = sourceOf[pair.right] }
-                    if not rightEntry.data then unreadable = true end
-                end
-                kept[#kept + 1] = { left = leftEntry, right = rightEntry }
+                kept[#kept + 1] = {
+                    left = keepL and { data = ReadLine(pair.left), src = sourceOf[pair.left] } or nil,
+                    right = keepR and { data = ReadLine(pair.right), src = sourceOf[pair.right] } or nil,
+                }
             end
         end
     end
@@ -362,12 +435,6 @@ PackTooltip = function(tooltip)
 
     packing = true
     local okPack, packErr = pcall(function()
-    if unreadable then
-        for _, pair in ipairs(linePairs) do
-            if LineBlocked(pair.left) then BlankFont(pair.left) end
-            if LineBlocked(pair.right) then BlankFont(pair.right) end
-        end
-    else
         for i, pair in ipairs(linePairs) do
             local row = kept[i]
             if row then
@@ -378,39 +445,34 @@ PackTooltip = function(tooltip)
                 BlankFont(pair.right)
             end
         end
-    end
-
-    local top, bottom
-    ForEachLine(tooltip, function(_, left, right)
-        local fs = Shown(left) and left or (Shown(right) and right or nil)
-        if not fs then return end
-        local lineTop, lineBottom = Metric(fs, "GetTop"), Metric(fs, "GetBottom")
-        if not lineTop or not lineBottom then return end
-        top = top and math.max(top, lineTop) or lineTop
-        bottom = bottom and math.min(bottom, lineBottom) or lineBottom
-    end)
-    local tipTop, tipBottom = Metric(tooltip, "GetTop"), Metric(tooltip, "GetBottom")
-    if top and bottom and tipTop and tipBottom then
-        local pad = (tipTop - top) + (bottom - tipBottom)
-        if pad < 8 then pad = 12 end
-        if pad > 48 then pad = 16 end
-        local height = (top - bottom) + pad
-        if height > 8 then pcall(tooltip.SetHeight, tooltip, height) end
-    end
+        AddBottomSpacer(linePairs[#kept + 1])
+        FitPackedTooltip(tooltip)
     end)
     packing = false
-    if not okPack and not errorOnce then
+    packedOnce[tooltip] = true
+    if okPack then
+        fitHold[tooltip] = true
+    elseif not errorOnce then
         errorOnce = true
         Say("|cffff8888couldn't remove a blocked line:|r " .. tostring(packErr))
     end
 end
 
 QueuePack = function(tooltip)
-    if packing or type(tooltip) ~= "table" or packQueued[tooltip] then return end
+    if packing or type(tooltip) ~= "table" then return end
+    if packedOnce[tooltip] or packQueued[tooltip] then return end
     packQueued[tooltip] = true
     local function run()
         packQueued[tooltip] = nil
-        PackTooltip(tooltip)
+        -- Second defer so other addons' After(0) stock/craft lines land first.
+        local function go()
+            PackTooltip(tooltip)
+        end
+        if C_Timer and C_Timer.After then
+            C_Timer.After(0, go)
+        else
+            go()
+        end
     end
     if C_Timer and C_Timer.After then
         C_Timer.After(0, run)
@@ -421,8 +483,7 @@ end
 
 -- upgradeOnly fills a line AddLine created before its fontstring was hooked.
 -- A later SetText (upgradeOnly false) is the real writer and replaces it.
--- Returns true when a blocked addon wrote the line and it should be stripped.
-Remember = function(fs, addon, detail, upgradeOnly)
+Remember = function(fs, addon, detail, upgradeOnly, tooltip)
     if packing or not fs or not addon then return false end
     NoteSeen(addon, detail)
     HookFontString(fs)
@@ -433,10 +494,21 @@ Remember = function(fs, addon, detail, upgradeOnly)
             pcall(fs.SetText, fs, prev.text)
             if prev.r then pcall(fs.SetTextColor, fs, prev.r, prev.g, prev.b) end
             packing = false
+            sourceOf[fs] = prev
             return false
         end
         sourceOf[fs] = { addon = addon, detail = detail }
-        return true
+        if type(tooltip) == "table" and packedOnce[tooltip] then
+            -- Already resized this fill — hide only, never refit.
+            packing = true
+            pcall(fs.SetText, fs, "")
+            pcall(fs.Hide, fs)
+            if fs.SetAlpha then pcall(fs.SetAlpha, fs, 0) end
+            packing = false
+        elseif type(tooltip) == "table" then
+            QueuePack(tooltip)
+        end
+        return false
     end
     local prev = sourceOf[fs]
     if upgradeOnly and prev and (IsPlayer(prev.addon) or not IsPlayer(addon)) then
@@ -477,19 +549,21 @@ local function InstallHooks(tooltip)
 end
 
 OnAdded = function(tooltip, isDouble)
-    if not db.enabled or packing then return end
+    if packing then return end
     local addon, detail = Caller()
     local count = PlainNumber(select(2, pcall(tooltip.NumLines, tooltip)))
     if not count or count < 1 then return end
-    local pack = Remember(FontString(tooltip, "TextLeft", count), addon, detail, true)
+    Remember(FontString(tooltip, "TextLeft", count), addon, detail, true, tooltip)
     if isDouble then
-        pack = Remember(FontString(tooltip, "TextRight", count), addon, detail, true) or pack
+        Remember(FontString(tooltip, "TextRight", count), addon, detail, true, tooltip)
     end
-    if pack then PackTooltip(tooltip) end
     InstallHooks(tooltip)
 end
 
 ClearSources = function(tooltip)
+    -- Leave packedOnce alone until OnHide. Clearing it here re-packs on every
+    -- in-place rebuild and strobes the tip.
+    packQueued[tooltip] = nil
     ForEachLine(tooltip, function(_, left, right)
         if left then sourceOf[left] = nil end
         if right then sourceOf[right] = nil end
@@ -625,11 +699,18 @@ end
 
 local function Refresh(tooltip)
     local overlay = overlays[tooltip] or MakeOverlay(tooltip)
-    if not db.enabled or not Flag(tooltip, "IsShown") or not OnScreen(tooltip) then
+    if not Flag(tooltip, "IsShown") or not OnScreen(tooltip) then
         overlay:Hide()
         return
     end
     InstallHooks(tooltip)
+
+    -- Labels can be off while the blocked-addon filter keeps running.
+    -- Do not QueuePack here — OnShow/OnUpdate would re-enter every layout tick.
+    if not db.enabled then
+        overlay:Hide()
+        return
+    end
 
     local entries = {}
     local maxWidth = 40
@@ -731,10 +812,18 @@ local function Track(tooltip)
         InstallHooks(tooltip)
         tooltip:HookScript("OnShow", function(self) SafeRefresh(self) end)
         tooltip:HookScript("OnHide", function(self)
+            packedOnce[self] = nil
+            fitHold[self] = nil
+            packQueued[self] = nil
             local overlay = overlays[self]
             if overlay then overlay:Hide() end
         end)
         tooltip:HookScript("OnUpdate", function(self)
+            if fitHold[self] and Flag(self, "IsShown") then
+                packing = true
+                pcall(FitPackedTooltip, self)
+                packing = false
+            end
             if db.enabled and Flag(self, "IsShown") then SafeRefresh(self) end
         end)
     end)
@@ -1168,7 +1257,10 @@ local function RegisterOptions()
         end
         if not shown then
             for tooltip in pairs(tracked) do
-                if Flag(tooltip, "IsShown") then PackTooltip(tooltip) end
+                if Flag(tooltip, "IsShown") then
+                    packedOnce[tooltip] = nil
+                    PackTooltip(tooltip, true)
+                end
             end
         end
         RefreshShown()
